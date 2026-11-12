@@ -1,0 +1,41 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "serviceCalls",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "companyStatus", "order": "ASCENDING" },
+        { "fieldPath": "moderationStatus", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "professionalProfiles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "accountStatus", "order": "ASCENDING" },
+        { "fieldPath": "moderationStatus", "order": "ASCENDING" },
+        { "fieldPath": "available", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "companyProfiles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "moderationStatus", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "companyMembers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "uid", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

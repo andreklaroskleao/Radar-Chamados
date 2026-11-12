@@ -1,0 +1,519 @@
+﻿rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function self(uid) { return signedIn() && request.auth.uid == uid; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function accountIsActive(uid) {
+      return exists(userPath(uid)) && get(userPath(uid)).data.accountStatus == 'active';
+    }
+    function subscriptionPath(scope, accountId) {
+      return /databases/$(database)/documents/accountSubscriptions/$(scope + '_' + accountId);
+    }
+    function planPath(planId) { return /databases/$(database)/documents/plans/$(planId); }
+    function subscriptionIsEffective(scope, accountId) {
+      let path = subscriptionPath(scope, accountId);
+      let planId = exists(path) ? get(path).data.planId : '';
+      return exists(path)
+        && get(path).data.status == 'active'
+        && get(path).data.startsAt <= request.time
+        && (!get(path).data.keys().hasAny(['expiresAt'])
+          || get(path).data.expiresAt == null
+          || get(path).data.expiresAt > request.time)
+        && exists(planPath(planId))
+        && get(planPath(planId)).data.enabled == true
+        && get(planPath(planId)).data.scope == scope;
+    }
+    function effectivePlanId(scope, accountId) {
+      return subscriptionIsEffective(scope, accountId)
+        ? get(subscriptionPath(scope, accountId)).data.planId
+        : 'basic_' + scope;
+    }
+    function featurePath(scope, accountId, featureKey) {
+      return /databases/$(database)/documents/planFeatures/$(effectivePlanId(scope, accountId) + '_' + featureKey);
+    }
+    function listLimitAllows(scope, accountId, featureKey, newSize, oldSize, unchanged) {
+      let path = featurePath(scope, accountId, featureKey);
+      return !exists(path)
+        || unchanged
+        || newSize < oldSize
+        || (get(path).data.enabled == true
+          && (get(path).data.limit == null || newSize <= get(path).data.limit));
+    }
+    function adminPath(uid) { return /databases/$(database)/documents/adminPermissions/$(uid); }
+    function isAdmin() {
+      return signedIn() && exists(adminPath(request.auth.uid)) && get(adminPath(request.auth.uid)).data.enabled == true;
+    }
+    function companyPath(companyId) { return /databases/$(database)/documents/companyProfiles/$(companyId); }
+    function companyPrivatePath(companyId) { return /databases/$(database)/documents/companyPrivate/$(companyId); }
+    function companyIsActive(companyId) {
+      return exists(companyPath(companyId)) && get(companyPath(companyId)).data.status == 'active';
+    }
+    function membershipPath(companyId, uid) {
+      return /databases/$(database)/documents/companyMembers/$(companyId + '_' + uid);
+    }
+    function memberRole(companyId, uid) {
+      return exists(membershipPath(companyId, uid)) ? get(membershipPath(companyId, uid)).data.role : '';
+    }
+    function isCompanyMember(companyId) {
+      return signedIn() && accountIsActive(request.auth.uid) && exists(membershipPath(companyId, request.auth.uid))
+        && get(membershipPath(companyId, request.auth.uid)).data.status == 'active';
+    }
+    function canManageCompany(companyId) {
+      return isAdmin() || (companyIsActive(companyId) && isCompanyMember(companyId)
+        && memberRole(companyId, request.auth.uid) in ['owner', 'manager']);
+    }
+    function professionalMeetsCall(uid, callId) {
+      let profilePath = /databases/$(database)/documents/professionalProfiles/$(uid);
+      let profile = exists(profilePath) ? get(profilePath).data : {};
+      let call = get(/databases/$(database)/documents/serviceCalls/$(callId)).data;
+      let requiredSpecialties = call.get('specialties', []);
+      return exists(profilePath)
+        && profile.get('accountStatus', '') == 'active'
+        && profile.get('experienceYears', 0) >= call.get('experienceYears', 0)
+        && (requiredSpecialties.size() == 0 || profile.get('specialties', []).hasAny(requiredSpecialties))
+        && profile.get('certifications', []).hasAll(call.get('requiredCertifications', []));
+    }
+    function validCallTransition(previousStatus, nextStatus, deadline) {
+      return previousStatus == nextStatus
+        || (previousStatus == 'draft' && nextStatus in ['published', 'cancelled'])
+        || (previousStatus in ['published', 'acceptingApplications']
+          && nextStatus in ['acceptingApplications', 'underReview', 'negotiating', 'filled', 'completed', 'cancelled'])
+        || (previousStatus == 'underReview' && nextStatus in ['negotiating', 'filled', 'completed', 'cancelled'])
+        || (previousStatus == 'negotiating' && nextStatus in ['filled', 'completed', 'cancelled'])
+        || (previousStatus == 'filled' && nextStatus in ['completed', 'cancelled'])
+        || (previousStatus == 'cancelled' && nextStatus == 'published' && deadline > request.time)
+        || (nextStatus == 'expired' && deadline <= request.time);
+    }
+    function validApplicationTransition(previousStatus, nextStatus) {
+      return previousStatus == nextStatus
+        || (previousStatus == 'submitted' && nextStatus in ['viewed', 'rejected'])
+        || (previousStatus == 'viewed' && nextStatus in ['underReview', 'selected', 'negotiating', 'approved', 'rejected'])
+        || (previousStatus == 'underReview' && nextStatus in ['selected', 'negotiating', 'approved', 'rejected'])
+        || (previousStatus == 'selected' && nextStatus in ['negotiating', 'approved', 'rejected'])
+        || (previousStatus == 'negotiating' && nextStatus in ['approved', 'rejected']);
+    }
+    function validTimestampUpdate() { return request.resource.data.updatedAt == request.time; }
+
+    match /users/{uid} {
+      allow get: if self(uid) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if self(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'accountStatus', 'createdAt', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 100
+        && request.resource.data.accountStatus == 'active'
+        && request.resource.data.createdAt == request.time && validTimestampUpdate();
+      allow update: if (self(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+        && request.resource.data.accountStatus == resource.data.accountStatus
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 100
+        && validTimestampUpdate()) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /professionalProfiles/{uid} {
+      allow get, list: if isAdmin() || self(uid)
+        || (resource.data.visibility == 'public' && resource.data.accountStatus == 'active' && resource.data.moderationStatus == 'approved');
+      allow create: if self(uid)
+        && request.resource.data.keys().hasOnly([
+          'userId', 'displayName', 'headline', 'bio', 'specialties', 'courses', 'qualifications', 'certifications', 'hasVehicle', 'ownsTools', 'experienceYears',
+          'stateCode', 'cityCode', 'serviceCityCodes', 'acceptsTravel', 'available',
+          'visibility', 'accountStatus', 'moderationStatus', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.userId == uid
+        && request.resource.data.accountStatus == 'active'
+        && request.resource.data.moderationStatus == 'pending'
+        && request.resource.data.visibility in ['private', 'public']
+        && request.resource.data.displayName is string && request.resource.data.displayName.size() <= 100
+        && request.resource.data.headline is string && request.resource.data.headline.size() <= 120
+        && request.resource.data.bio is string && request.resource.data.bio.size() <= 1600
+        && request.resource.data.specialties is list && request.resource.data.specialties.size() <= 30
+        && request.resource.data.courses is list && request.resource.data.courses.size() <= 30
+        && request.resource.data.qualifications is list && request.resource.data.qualifications.size() <= 30
+        && request.resource.data.certifications is list && request.resource.data.certifications.size() <= 30
+        && request.resource.data.hasVehicle is bool && request.resource.data.ownsTools is bool
+        && request.resource.data.serviceCityCodes is list && request.resource.data.serviceCityCodes.size() <= 50
+        && listLimitAllows('individual', uid, 'serviceCities', request.resource.data.serviceCityCodes.size(), -1, false)
+        && listLimitAllows('individual', uid, 'specialties', request.resource.data.specialties.size(), -1, false)
+        && listLimitAllows('individual', uid, 'courses', request.resource.data.courses.size(), -1, false)
+        && listLimitAllows('individual', uid, 'qualifications', request.resource.data.qualifications.size(), -1, false)
+        && listLimitAllows('individual', uid, 'certifications', request.resource.data.certifications.size(), -1, false)
+        && request.resource.data.experienceYears is number
+        && request.resource.data.stateCode is string && request.resource.data.stateCode.size() == 2
+        && request.resource.data.cityCode is string
+        && request.resource.data.acceptsTravel is bool && request.resource.data.available is bool
+        && request.resource.data.createdAt == request.time && validTimestampUpdate();
+      allow update: if isAdmin() || (self(uid)
+        && resource.data.accountStatus == 'active'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'headline', 'bio', 'specialties', 'courses', 'qualifications', 'certifications', 'hasVehicle', 'ownsTools', 'experienceYears', 'stateCode',
+          'cityCode', 'serviceCityCodes', 'acceptsTravel', 'available', 'visibility', 'updatedAt', 'moderationStatus'
+        ])
+        && request.resource.data.userId == resource.data.userId
+        && (request.resource.data.moderationStatus == 'pending'
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visibility', 'updatedAt']))
+        && request.resource.data.visibility in ['private', 'public']
+        && request.resource.data.displayName is string && request.resource.data.displayName.size() <= 100
+        && request.resource.data.headline is string && request.resource.data.headline.size() <= 120
+        && request.resource.data.bio is string && request.resource.data.bio.size() <= 1600
+        && request.resource.data.specialties is list && request.resource.data.specialties.size() <= 30
+        && request.resource.data.courses is list && request.resource.data.courses.size() <= 30
+        && request.resource.data.qualifications is list && request.resource.data.qualifications.size() <= 30
+        && request.resource.data.certifications is list && request.resource.data.certifications.size() <= 30
+        && request.resource.data.hasVehicle is bool && request.resource.data.ownsTools is bool
+        && request.resource.data.serviceCityCodes is list && request.resource.data.serviceCityCodes.size() <= 50
+        && listLimitAllows('individual', uid, 'serviceCities', request.resource.data.serviceCityCodes.size(), resource.data.serviceCityCodes.size(), request.resource.data.serviceCityCodes == resource.data.serviceCityCodes)
+        && listLimitAllows('individual', uid, 'specialties', request.resource.data.specialties.size(), resource.data.specialties.size(), request.resource.data.specialties == resource.data.specialties)
+        && listLimitAllows('individual', uid, 'courses', request.resource.data.courses.size(), resource.data.courses.size(), request.resource.data.courses == resource.data.courses)
+        && listLimitAllows('individual', uid, 'qualifications', request.resource.data.qualifications.size(), resource.data.qualifications.size(), request.resource.data.qualifications == resource.data.qualifications)
+        && listLimitAllows('individual', uid, 'certifications', request.resource.data.certifications.size(), resource.data.certifications.size(), request.resource.data.certifications == resource.data.certifications)
+        && request.resource.data.stateCode is string && request.resource.data.stateCode.size() == 2
+        && request.resource.data.cityCode is string
+        && request.resource.data.acceptsTravel is bool && request.resource.data.available is bool
+        && validTimestampUpdate());
+      allow delete: if isAdmin();
+    }
+
+    match /professionalPrivate/{uid} {
+      allow read: if self(uid) || isAdmin();
+      allow create, update: if isAdmin() || (self(uid)
+        && accountIsActive(uid)
+        && request.resource.data.keys().hasOnly(['phone', 'whatsappAllowed', 'updatedAt'])
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 20
+        && request.resource.data.whatsappAllowed is bool
+        && validTimestampUpdate());
+      allow delete: if isAdmin();
+    }
+
+    match /companyProfiles/{companyId} {
+      allow get, list: if isAdmin() || isCompanyMember(companyId)
+        || (resource.data.visibility == 'public' && resource.data.status == 'active' && resource.data.moderationStatus == 'approved');
+      allow create: if signedIn() && accountIsActive(request.auth.uid)
+        && request.resource.data.keys().hasOnly([
+          'companyId', 'name', 'category', 'description', 'stateCode', 'cityCode', 'serviceCityCodes', 'acceptsTravel',
+          'visibility', 'moderationStatus', 'status', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.companyId == companyId
+        && request.resource.data.name is string && request.resource.data.name.size() <= 120
+        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && request.resource.data.description is string && request.resource.data.description.size() <= 1600
+        && request.resource.data.stateCode is string && request.resource.data.stateCode.size() == 2
+        && request.resource.data.cityCode is string
+        && request.resource.data.serviceCityCodes is list && request.resource.data.serviceCityCodes.size() <= 50
+        && listLimitAllows('company', companyId, 'serviceCities', request.resource.data.serviceCityCodes.size(), -1, false)
+        && request.resource.data.acceptsTravel is bool
+        && request.resource.data.visibility == 'private'
+        && request.resource.data.moderationStatus == 'pending'
+        && request.resource.data.status == 'active'
+        && existsAfter(membershipPath(companyId, request.auth.uid))
+        && getAfter(membershipPath(companyId, request.auth.uid)).data.role == 'owner'
+        && getAfter(membershipPath(companyId, request.auth.uid)).data.status == 'active'
+        && existsAfter(companyPrivatePath(companyId))
+        && getAfter(companyPrivatePath(companyId)).data.ownerUid == request.auth.uid
+        && request.resource.data.createdAt == request.time && validTimestampUpdate();
+      allow update: if isAdmin() || (canManageCompany(companyId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'category', 'description', 'stateCode', 'cityCode', 'serviceCityCodes', 'acceptsTravel', 'visibility', 'moderationStatus', 'updatedAt'
+        ])
+        && request.resource.data.companyId == resource.data.companyId
+        && (request.resource.data.moderationStatus == 'pending'
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visibility', 'updatedAt']))
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.name is string && request.resource.data.name.size() <= 120
+        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && request.resource.data.description is string && request.resource.data.description.size() <= 1600
+        && request.resource.data.stateCode is string && request.resource.data.stateCode.size() == 2
+        && request.resource.data.cityCode is string
+        && request.resource.data.serviceCityCodes is list && request.resource.data.serviceCityCodes.size() <= 50
+        && listLimitAllows('company', companyId, 'serviceCities', request.resource.data.serviceCityCodes.size(), resource.data.serviceCityCodes.size(), request.resource.data.serviceCityCodes == resource.data.serviceCityCodes)
+        && request.resource.data.acceptsTravel is bool
+        && request.resource.data.visibility in ['private', 'public']
+        && validTimestampUpdate());
+      allow delete: if isAdmin();
+    }
+
+    match /companyPrivate/{companyId} {
+      allow read: if isAdmin() || isCompanyMember(companyId);
+      allow create: if isAdmin() || (signedIn() && accountIsActive(request.auth.uid)
+        && !exists(companyPath(companyId))
+        && existsAfter(companyPath(companyId))
+        && existsAfter(membershipPath(companyId, request.auth.uid))
+        && getAfter(membershipPath(companyId, request.auth.uid)).data.role == 'owner'
+        && getAfter(membershipPath(companyId, request.auth.uid)).data.status == 'active'
+        && request.resource.data.keys().hasOnly(['ownerUid', 'phone', 'contactName', 'contactEmail', 'legalName', 'cnpj', 'commercialAddress', 'whatsappAllowed', 'updatedAt'])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 20
+        && request.resource.data.contactName is string && request.resource.data.contactName.size() <= 100
+        && request.resource.data.contactEmail is string && request.resource.data.contactEmail.size() <= 254
+        && request.resource.data.legalName is string && request.resource.data.legalName.size() <= 160
+        && request.resource.data.cnpj is string && request.resource.data.cnpj.matches('^([0-9]{14})?$')
+        && request.resource.data.commercialAddress is string && request.resource.data.commercialAddress.size() <= 250
+        && request.resource.data.whatsappAllowed is bool && validTimestampUpdate());
+      allow update: if isAdmin() || (canManageCompany(companyId)
+        && request.resource.data.keys().hasOnly(['ownerUid', 'phone', 'contactName', 'contactEmail', 'legalName', 'cnpj', 'commercialAddress', 'whatsappAllowed', 'updatedAt'])
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 20
+        && request.resource.data.contactName is string && request.resource.data.contactName.size() <= 100
+        && request.resource.data.contactEmail is string && request.resource.data.contactEmail.size() <= 254
+        && request.resource.data.legalName is string && request.resource.data.legalName.size() <= 160
+        && request.resource.data.cnpj is string && request.resource.data.cnpj.matches('^([0-9]{14})?$')
+        && request.resource.data.commercialAddress is string && request.resource.data.commercialAddress.size() <= 250
+        && request.resource.data.whatsappAllowed is bool && validTimestampUpdate());
+      allow delete: if isAdmin();
+    }
+    match /companyMembers/{memberId} {
+      allow get, list: if isAdmin() || (signedIn() && (
+        resource.data.uid == request.auth.uid || isCompanyMember(resource.data.companyId)
+      ));
+      allow create: if isAdmin()
+        || (signedIn()
+          && request.resource.data.keys().hasOnly(['companyId', 'uid', 'role', 'status', 'createdAt'])
+          && memberId == request.resource.data.companyId + '_' + request.resource.data.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.role == 'owner' && accountIsActive(request.auth.uid)
+          && request.resource.data.status == 'active'
+          && request.resource.data.createdAt == request.time
+          && existsAfter(/databases/$(database)/documents/companyProfiles/$(request.resource.data.companyId))
+          && existsAfter(companyPrivatePath(request.resource.data.companyId))
+          && getAfter(companyPrivatePath(request.resource.data.companyId)).data.ownerUid == request.auth.uid)
+        || (signedIn()
+          && request.resource.data.keys().hasOnly(['companyId', 'uid', 'role', 'status', 'createdAt'])
+          && memberId == request.resource.data.companyId + '_' + request.resource.data.uid
+          && canManageCompany(request.resource.data.companyId)
+          && request.resource.data.uid is string
+          && accountIsActive(request.resource.data.uid)
+          && request.resource.data.role in ['manager', 'member']
+          && (memberRole(request.resource.data.companyId, request.auth.uid) == 'owner'
+            || request.resource.data.role == 'member')
+          && request.resource.data.status in ['active', 'pending']
+          && request.resource.data.createdAt == request.time);
+      allow update: if isAdmin()
+        || (canManageCompany(resource.data.companyId)
+          && memberId == resource.data.companyId + '_' + resource.data.uid
+          && request.resource.data.companyId == resource.data.companyId
+          && request.resource.data.uid == resource.data.uid
+          && resource.data.role != 'owner'
+          && memberRole(resource.data.companyId, request.auth.uid) == 'owner'
+          && request.resource.data.role in ['manager', 'member']
+          && request.resource.data.status in ['active', 'inactive', 'pending'])
+        || (canManageCompany(resource.data.companyId)
+          && memberId == resource.data.companyId + '_' + resource.data.uid
+          && request.resource.data.companyId == resource.data.companyId
+          && request.resource.data.uid == resource.data.uid
+          && resource.data.role != 'owner'
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.status in ['active', 'inactive', 'pending'])
+        || (self(resource.data.uid)
+          && memberId == resource.data.companyId + '_' + resource.data.uid
+          && resource.data.role != 'owner'
+          && request.resource.data.companyId == resource.data.companyId
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.status == 'inactive');
+      allow delete: if isAdmin();
+    }
+    match /serviceCalls/{callId} {
+      allow get, list: if isAdmin()
+        || (resource.data.status in ['published', 'acceptingApplications'] && resource.data.companyStatus == 'active' && resource.data.moderationStatus == 'approved')
+        || canManageCompany(resource.data.companyId);
+      allow create: if signedIn() && canManageCompany(request.resource.data.companyId)
+        && request.resource.data.keys().hasOnly([
+          'serviceCallId', 'companyId', 'companyStatus', 'title', 'description', 'category', 'providerType',
+          'stateCode', 'cityCode', 'specialties', 'technicalRequirements', 'requiredCertifications', 'experienceYears', 'professionalCount',
+          'compensationDescription', 'travelAssistance', 'executionDate', 'status', 'moderationStatus', 'deadline',
+          'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.serviceCallId == callId
+        && request.resource.data.companyStatus == 'active'
+        && companyIsActive(request.resource.data.companyId)
+        && request.resource.data.title is string && request.resource.data.title.size() <= 120
+        && request.resource.data.description is string && request.resource.data.description.size() <= 3000
+        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && request.resource.data.providerType in ['professional', 'company', 'both']
+        && request.resource.data.stateCode is string && request.resource.data.stateCode.size() == 2
+        && request.resource.data.cityCode is string
+        && request.resource.data.specialties is list && request.resource.data.specialties.size() <= 30
+        && request.resource.data.technicalRequirements is string && request.resource.data.technicalRequirements.size() <= 2000
+        && request.resource.data.requiredCertifications is list && request.resource.data.requiredCertifications.size() <= 30
+        && request.resource.data.experienceYears is number && request.resource.data.experienceYears >= 0 && request.resource.data.experienceYears <= 60
+        && request.resource.data.professionalCount is number && request.resource.data.professionalCount >= 1 && request.resource.data.professionalCount <= 100
+        && request.resource.data.compensationDescription is string && request.resource.data.compensationDescription.size() <= 120
+        && request.resource.data.travelAssistance is bool
+        && (request.resource.data.executionDate == null || request.resource.data.executionDate is timestamp)
+        && request.resource.data.status == 'published'
+        && request.resource.data.moderationStatus == 'pending'
+        && request.resource.data.deadline is timestamp && request.resource.data.deadline > request.time
+        && request.resource.data.createdAt == request.time && validTimestampUpdate();
+      allow update: if isAdmin() || (canManageCompany(resource.data.companyId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'title', 'description', 'category', 'providerType', 'stateCode', 'cityCode', 'specialties', 'technicalRequirements',
+          'requiredCertifications', 'experienceYears', 'professionalCount', 'compensationDescription', 'travelAssistance', 'executionDate', 'moderationStatus',
+          'status', 'deadline', 'updatedAt'
+        ])
+        && request.resource.data.companyId == resource.data.companyId
+        && (request.resource.data.moderationStatus == resource.data.moderationStatus || request.resource.data.moderationStatus == 'pending')
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['title', 'description', 'category', 'providerType', 'stateCode', 'cityCode', 'specialties', 'technicalRequirements', 'requiredCertifications', 'experienceYears', 'professionalCount', 'compensationDescription', 'travelAssistance', 'executionDate', 'deadline'])
+          || request.resource.data.moderationStatus == 'pending')
+        && request.resource.data.providerType in ['professional', 'company', 'both']
+        && request.resource.data.status in ['draft', 'published', 'acceptingApplications', 'underReview', 'negotiating', 'filled', 'completed', 'cancelled', 'expired']
+        && validCallTransition(resource.data.status, request.resource.data.status, request.resource.data.deadline)
+        && (request.resource.data.status not in ['published', 'acceptingApplications'] || request.resource.data.deadline > request.time)
+        && request.resource.data.title is string && request.resource.data.title.size() <= 120
+        && request.resource.data.description is string && request.resource.data.description.size() <= 3000
+        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && request.resource.data.specialties is list && request.resource.data.specialties.size() <= 30
+        && request.resource.data.technicalRequirements is string && request.resource.data.technicalRequirements.size() <= 2000
+        && request.resource.data.requiredCertifications is list && request.resource.data.requiredCertifications.size() <= 30
+        && request.resource.data.experienceYears is number && request.resource.data.experienceYears >= 0 && request.resource.data.experienceYears <= 60
+        && request.resource.data.professionalCount is number && request.resource.data.professionalCount >= 1 && request.resource.data.professionalCount <= 100
+        && request.resource.data.compensationDescription is string && request.resource.data.compensationDescription.size() <= 120
+        && request.resource.data.travelAssistance is bool
+        && (request.resource.data.executionDate == null || request.resource.data.executionDate is timestamp)
+        && request.resource.data.updatedAt == request.time);
+      allow delete: if isAdmin();
+    }
+
+    match /callApplications/{applicationId} {
+      allow get, list: if isAdmin()
+        || (signedIn() && resource.data.applicantUid == request.auth.uid)
+        || canManageCompany(resource.data.companyId);
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'applicationId', 'serviceCallId', 'companyId', 'applicantType', 'applicantId',
+          'applicantUid', 'message', 'status', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.applicationId == applicationId
+        && applicationId == request.resource.data.serviceCallId + '_' + request.resource.data.applicantType + '_' + request.resource.data.applicantId
+        && request.resource.data.applicantUid == request.auth.uid
+        && accountIsActive(request.auth.uid)
+        && request.resource.data.message is string && request.resource.data.message.size() <= 1200
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.createdAt == request.time && validTimestampUpdate()
+        && exists(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId))
+        && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.status in ['published', 'acceptingApplications']
+        && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.moderationStatus == 'approved'
+        && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.companyStatus == 'active'
+        && companyIsActive(request.resource.data.companyId)
+        && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.deadline > request.time
+        && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.companyId == request.resource.data.companyId
+        && (
+          (request.resource.data.applicantType == 'professional'
+            && request.resource.data.applicantId == request.auth.uid
+            && professionalMeetsCall(request.auth.uid, request.resource.data.serviceCallId)
+            && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.providerType in ['professional', 'both'])
+          || (request.resource.data.applicantType == 'company'
+            && request.resource.data.applicantId != request.resource.data.companyId
+            && companyIsActive(request.resource.data.applicantId)
+            && isCompanyMember(request.resource.data.applicantId)
+            && get(/databases/$(database)/documents/serviceCalls/$(request.resource.data.serviceCallId)).data.providerType in ['company', 'both'])
+        );
+      allow update: if isAdmin()
+        || (signedIn() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.status in ['viewed', 'underReview', 'selected', 'negotiating', 'approved', 'rejected']
+          && validApplicationTransition(resource.data.status, request.resource.data.status)
+          && canManageCompany(resource.data.companyId))
+        || (signedIn() && resource.data.applicantUid == request.auth.uid
+          && resource.data.status == 'submitted'
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.updatedAt == request.time);
+      allow delete: if isAdmin();
+    }
+
+    match /reports/{reportId} {
+      allow get: if isAdmin() || (signedIn() && resource.data.reporterUid == request.auth.uid);
+      allow list: if isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['reportId', 'reporterUid', 'targetType', 'targetId', 'reason', 'description', 'status', 'createdAt'])
+        && request.resource.data.reportId == reportId
+        && request.resource.data.reporterUid == request.auth.uid
+        && request.resource.data.targetType in ['professional', 'company', 'serviceCall', 'user']
+        && request.resource.data.targetId is string
+        && request.resource.data.reason is string
+        && request.resource.data.description is string && request.resource.data.description.size() <= 1500
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'resolution', 'reviewedAt', 'reviewedBy'])
+        && request.resource.data.status in ['open', 'reviewed', 'resolved']
+        && request.resource.data.reviewedBy == request.auth.uid
+        && request.resource.data.reviewedAt == request.time;
+      allow delete: if false;
+    }
+
+    match /notifications/{uid}/items/{notificationId} {
+      allow get, list: if self(uid) || isAdmin();
+      allow create: if isAdmin()
+        || (signedIn()
+          && request.resource.data.keys().hasOnly(['title', 'body', 'applicationId', 'serviceCallId', 'companyId', 'actorUid', 'createdAt', 'readAt'])
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.createdAt == request.time
+          && existsAfter(/databases/$(database)/documents/callApplications/$(request.resource.data.applicationId))
+          && getAfter(/databases/$(database)/documents/callApplications/$(request.resource.data.applicationId)).data.applicantUid == uid
+          && getAfter(/databases/$(database)/documents/callApplications/$(request.resource.data.applicationId)).data.companyId == request.resource.data.companyId
+          && canManageCompany(request.resource.data.companyId));
+      allow update: if self(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt'])
+        && request.resource.data.readAt == request.time;
+      allow delete: if self(uid) || isAdmin();
+    }
+
+    match /distributionQueue/{itemId} {
+      allow read, create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /outreachEvents/{eventId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /adminPermissions/{uid} {
+      allow get: if self(uid) || isAdmin();
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /plans/{planId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /planFeatures/{featureId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /accountSubscriptions/{subscriptionId} {
+      allow get: if isAdmin()
+        || (signedIn() && resource.data.scope == 'individual' && resource.data.accountId == request.auth.uid)
+        || (signedIn() && resource.data.scope == 'company' && isCompanyMember(resource.data.accountId));
+      allow list, write: if isAdmin();
+    }
+
+    match /planChangeHistory/{eventId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /adminAuditLogs/{eventId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
