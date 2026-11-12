@@ -1,8 +1,9 @@
-﻿import { NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { brazilianStates, IBGE_API_BASE, IBGE_REVALIDATE_SECONDS } from '@/lib/geography/ibge';
 
 type Municipality = { id: number; nome: string };
-export const revalidate = IBGE_REVALIDATE_SECONDS;
+// Next segment config must be a literal so the build analyzer can read it.
+export const revalidate = 86400;
 
 export async function GET(request: Request) {
   const abbreviation = new URL(request.url).searchParams.get('state')?.trim().toUpperCase();
