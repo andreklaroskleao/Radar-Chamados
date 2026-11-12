@@ -1,5 +1,4 @@
 import type { Metadata } from 'next';
-import { IBGE_REVALIDATE_SECONDS } from '@/lib/geography/ibge';
 import { getBrazilStateBoundaries } from '@/lib/geography/ibge-server';
 import { CoverageExplorer } from './coverage-explorer';
 import type { CoverageFeatureCollection } from '@/lib/geography/types';
@@ -9,7 +8,8 @@ export const metadata: Metadata = {
   description: 'Explore a cobertura geográfica do Radar Comercial Regional por estado e município.'
 };
 
-export const revalidate = IBGE_REVALIDATE_SECONDS;
+// Next segment config must be a literal so the build analyzer can read it.
+export const revalidate = 86400;
 
 export default async function CoveragePage() {
   let initialStates: CoverageFeatureCollection | null = null;
