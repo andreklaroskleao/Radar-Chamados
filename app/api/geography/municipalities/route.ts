@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server';
 import type { CoverageFeature, CoverageFeatureCollection, GeoJSONGeometry } from '@/lib/geography/types';
 import { brazilianStates, IBGE_API_BASE, IBGE_REVALIDATE_SECONDS } from '@/lib/geography/ibge';
 
-export const revalidate = IBGE_REVALIDATE_SECONDS;
+// Next segment config must be a literal so the build analyzer can read it.
+export const revalidate = 86400;
 
 type IbgeFeature = {
   type: 'Feature';
