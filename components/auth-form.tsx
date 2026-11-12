@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState, type FormEvent } from 'react';
@@ -8,7 +8,12 @@ const messages:Record<string,string>={
  'auth/invalid-credential':'E-mail ou senha não conferem.','auth/invalid-email':'Informe um e-mail válido.',
  'auth/weak-password':'Use uma senha com pelo menos 6 caracteres.',
  'auth/operation-not-allowed':'O provedor e-mail/senha ainda precisa ser habilitado no Firebase Authentication.',
- 'auth/network-request-failed':'Sem conexão com o Firebase. Confira sua internet e tente novamente.'
+ 'auth/network-request-failed':'Sem conexão com o Firebase Authentication. Confira a conexão e tente novamente.',
+ 'permission-denied':'A autenticação foi aceita, mas o Firestore recusou a leitura ou gravação do perfil. Confira as regras publicadas e tente novamente.',
+ 'unauthenticated':'A autenticação foi aceita, mas o Firestore não recebeu uma sessão válida para criar o perfil. Saia e entre novamente.',
+ 'unavailable':'A autenticação foi aceita, mas o Firestore está indisponível ou sem resposta. Tente novamente em instantes.',
+ 'deadline-exceeded':'A autenticação foi aceita, mas a operação no Firestore excedeu o tempo limite. Tente entrar novamente.',
+ 'failed-precondition':'A autenticação foi aceita, mas uma condição do Firestore impediu a gravação do perfil.'
 };
 export function AuthForm({mode}:{mode:'login'|'register'}){
  const router=useRouter();const [name,setName]=useState('');const [email,setEmail]=useState('');const [password,setPassword]=useState('');
@@ -16,7 +21,7 @@ export function AuthForm({mode}:{mode:'login'|'register'}){
  async function submit(event:FormEvent<HTMLFormElement>){
   event.preventDefault();setBusy(true);setMessage('');
   try{if(isRegister)await registerWithEmail(name,email,password);else await loginWithEmail(email,password);router.replace('/painel');}
-  catch(error){const code=typeof error==='object'&&error&&'code'in error?String(error.code):'';setMessage(messages[code]||'Não foi possível concluir. Confira os dados e tente novamente.');}
+  catch(error){const code=typeof error==='object'&&error&&'code'in error?String(error.code):'';const detail=error instanceof Error?error.message:'';console.error('[Radar] Falha no fluxo de autenticação/perfil:',{code:code||'sem código',message:detail});setMessage(messages[code]||(code?`Não foi possível concluir. Código Firebase: ${code}.`:'Não foi possível concluir. Confira o Console do navegador para ver o erro técnico.'));}
   finally{setBusy(false);}
  }
  async function resetPassword(){
