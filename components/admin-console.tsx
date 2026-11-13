@@ -1,6 +1,6 @@
-﻿'use client';
-import { useEffect, useState, type FormEvent } from 'react';
-import { collection, doc, getDoc, getDocs, limit, query, serverTimestamp, Timestamp, updateDoc, where, writeBatch } from 'firebase/firestore';
+'use client';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { collection, doc, getDoc, getDocs, limit, query, serverTimestamp, Timestamp, where, writeBatch } from 'firebase/firestore';
 import { useRadarSession } from '@/lib/firebase/session';
 import { getFirebaseClient } from '@/lib/firebase/client';
 import { ProtectedArea } from '@/components/protected-area';
@@ -33,6 +33,7 @@ function subscriptionState(value:Subscription|null){
 }
 function AdminContent(){
  const {user}=useRadarSession();const [admin,setAdmin]=useState(false);const [loading,setLoading]=useState(true);
+ const [accessCheck,setAccessCheck]=useState<{status:'checking'|'allowed'|'denied'|'error';projectId:string;uid:string;documentExists?:boolean;enabled?:boolean;code?:string}>({status:'checking',projectId:'',uid:''});
  const [profiles,setProfiles]=useState<Entry[]>([]);const [companies,setCompanies]=useState<Entry[]>([]);const [calls,setCalls]=useState<Entry[]>([]);const [planDefaults,setPlanDefaults]=useState<Record<string,boolean>>({});
  const [target,setTarget]=useState('');const [scope,setScope]=useState<'individual'|'company'>('individual');
  const [accountSearch,setAccountSearch]=useState('');
@@ -40,12 +41,15 @@ function AdminContent(){
  const [grantType,setGrantType]=useState<'manual'|'trial'|'courtesy'>('manual');const [startDate,setStartDate]=useState('');const [lastDay,setLastDay]=useState('');const [customExpiry,setCustomExpiry]=useState(false);
  const [subscription,setSubscription]=useState<Subscription|null>(null);const [history,setHistory]=useState<HistoryItem[]>([]);
  const [message,setMessage]=useState('');
- async function load(){
-  if(!user)return;setLoading(true);
+ const load=useCallback(async()=>{
+  if(!user){setLoading(false);return;}setLoading(true);setMessage('');
   try{
-   const {db}=getFirebaseClient();const adminDoc=await getDoc(doc(db,'adminPermissions',user.uid));
-   const allowed=adminDoc.exists()&&adminDoc.data().enabled===true;setAdmin(allowed);
-   if(!allowed){setLoading(false);return;}
+   const {db,app}=getFirebaseClient();
+   const adminDoc=await getDoc(doc(db,'adminPermissions',user.uid));
+   const enabled=adminDoc.exists()&&adminDoc.data().enabled===true;
+   setAdmin(enabled);
+   setAccessCheck({status:enabled?'allowed':'denied',projectId:app.options.projectId||'desconhecido',uid:user.uid,documentExists:adminDoc.exists(),enabled:adminDoc.exists()?adminDoc.data().enabled===true:false});
+   if(!enabled)return;
    const [p,c,op,planDocs]=await Promise.all([
     getDocs(query(collection(db,'professionalProfiles'),limit(100))),
     getDocs(query(collection(db,'companyProfiles'),limit(100))),
@@ -53,10 +57,18 @@ function AdminContent(){
     getDocs(query(collection(db,'plans'),limit(100)))
    ]);
    setProfiles(p.docs.map(d=>({id:d.id,...d.data()} as Entry)));setCompanies(c.docs.map(d=>({id:d.id,...d.data()} as Entry)));setCalls(op.docs.map(d=>({id:d.id,...d.data()} as Entry)));setPlanDefaults(Object.fromEntries(planDocs.docs.map(d=>[d.id,d.data().isDefault===true])));
-  }catch{setMessage('Não foi possível carregar a administração. Confirme o acesso e as regras.');}
+  }catch(error){
+   const code=typeof error==='object'&&error&&'code'in error?String(error.code):'erro-desconhecido';
+   let projectId='desconhecido';try{projectId=getFirebaseClient().app.options.projectId||projectId;}catch{}
+   setAdmin(false);setAccessCheck({status:'error',projectId,uid:user.uid,code});
+   setMessage(`Não foi possível consultar sua permissão administrativa no Firestore (${code}). O documento não foi tratado como ausente: confira se esta versão está conectada ao projeto esperado e se a leitura de adminPermissions/{UID} está permitida.`);
+  }
   finally{setLoading(false);}
- }
- useEffect(()=>{void load();},[user]);
+ },[user]);
+ useEffect(()=>{
+  const timer=window.setTimeout(()=>{void load();},0);
+  return()=>window.clearTimeout(timer);
+ },[load]);
  async function moderate(collectionName:'professionalProfiles'|'companyProfiles'|'serviceCalls',id:string,status:'approved'|'rejected'|'pending'){
   if(!user)return;
   try{
@@ -144,7 +156,9 @@ function AdminContent(){
   }catch{setMessage('Não foi possível atualizar o acesso do plano.');}
  }
  if(loading)return <main className="page-wrap"><div className="notice-card">Carregando administração…</div></main>;
- if(!admin)return <main className="page-wrap"><div className="notice-card"><h1>Área administrativa restrita</h1><p>Esta conta não possui permissão administrativa ativa.</p><p>Após entrar, peça ao proprietário do projeto para criar <code>adminPermissions/{user?.uid}</code> com <code>enabled: true</code> no Firestore. O app não concede essa permissão.</p></div></main>;
+ if(!admin)return <main className="page-wrap"><div className="notice-card"><h1>{accessCheck.status==='error'?'Não foi possível verificar o acesso':'Área administrativa restrita'}</h1>
+  {accessCheck.status==='error'?<><p>{message}</p><p>UID autenticado: <code>{accessCheck.uid||user?.uid}</code><br/>Projeto Firebase conectado: <code>{accessCheck.projectId}</code></p><button className="button button-secondary" onClick={()=>void load()}>Verificar novamente</button></>:<><p>O Firestore respondeu que a permissão desta conta não está ativa.</p><p>UID autenticado: <code>{accessCheck.uid||user?.uid}</code><br/>Projeto Firebase conectado: <code>{accessCheck.projectId}</code><br/>Documento encontrado: <code>{String(accessCheck.documentExists===true)}</code><br/>Campo enabled: <code>{String(accessCheck.enabled===true)}</code></p><p>O acesso exige <code>adminPermissions/{user?.uid}</code> com <code>enabled: true</code>. O app não concede essa permissão.</p><button className="button button-secondary" onClick={()=>void load()}>Verificar novamente</button></>}
+ </div></main>;
  const accountOptions=(scope==='individual'?profiles:companies).filter(item=>((item.displayName||item.name||'')+' '+item.id).toLocaleLowerCase('pt-BR').includes(accountSearch.toLocaleLowerCase('pt-BR')));
  return <main className="page-wrap"><div className="page-heading"><div><p className="eyebrow">GESTÃO DA PLATAFORMA</p><h1>Administração</h1><p>Modere cadastros, gerencie contas e conceda planos manualmente.</p></div><div className="form-actions"><a className="button button-secondary" href="/admin/planos">Configurar planos</a><a className="button button-secondary" href="/admin/distribuicao">Abrir fila de distribuição</a><a className="button button-secondary" href="/admin/denuncias">Abrir denúncias</a></div></div>
   {message&&<p className="form-message" role="status">{message}</p>}
