@@ -1,7 +1,7 @@
-﻿'use client';
+'use client';
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { initializeFirestore } from 'firebase/firestore';
 
 const config = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -19,6 +19,9 @@ export function isFirebaseConfigured() {
 export function getFirebaseClient() {
   if (!isFirebaseConfigured()) throw new Error('A configuração pública do Firebase está incompleta. Confira as variáveis NEXT_PUBLIC_FIREBASE_*.');
   const app = getApps().length ? getApp() : initializeApp(config);
-  return { app, auth: getAuth(app), db: getFirestore(app) };
+  // Force WebChannel long-polling because some mobile networks and proxies
+  // report a successful Auth connection but leave Firestore marked offline.
+  const db = initializeFirestore(app, { experimentalForceLongPolling: true });
+  return { app, auth: getAuth(app), db };
 }
 
