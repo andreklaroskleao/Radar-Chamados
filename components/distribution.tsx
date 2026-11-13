@@ -1,7 +1,9 @@
-﻿'use client';
+'use client';
+import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 import { collection, doc, getDoc, getDocs, limit, query, serverTimestamp, where, writeBatch } from 'firebase/firestore';
 import { getFirebaseClient } from '@/lib/firebase/client';
+import { firebaseOperationError } from '@/lib/firebase/errors';
 import { useRadarSession } from '@/lib/firebase/session';
 import { ProtectedArea } from '@/components/protected-area';
 
@@ -10,23 +12,38 @@ type Candidate={id:string;type:'professional'|'company';name:string;category?:st
 type Match={candidate:Candidate;priority:number;reasons:string[];whatsAppUrl?:string};
 const criterionVersion='1.0';
 function DistributionContent(){
- const {user}=useRadarSession();const [calls,setCalls]=useState<Call[]>([]);const [selected,setSelected]=useState('');
+ const {user}=useRadarSession();const [calls,setCalls]=useState<Call[]>([]);const [selected,setSelected]=useState('');const [isAdmin,setIsAdmin]=useState(false);
  const [professionals,setProfessionals]=useState<Candidate[]>([]);const [companies,setCompanies]=useState<Candidate[]>([]);
- const [matches,setMatches]=useState<Match[]>([]);const [loading,setLoading]=useState(true);const [error,setError]=useState('');const [message,setMessage]=useState('');
+ const [whatsAppUrls,setWhatsAppUrls]=useState<Record<string,string>>({});const [loading,setLoading]=useState(true);const [error,setError]=useState('');const [message,setMessage]=useState('');
  useEffect(()=>{
-  const {db}=getFirebaseClient();
-  Promise.all([
-   getDocs(query(collection(db,'serviceCalls'),where('status','in',['published','acceptingApplications']),where('companyStatus','==','active'),where('moderationStatus','==','approved'),limit(100))),
-   getDocs(query(collection(db,'professionalProfiles'),where('visibility','==','public'),where('accountStatus','==','active'),where('moderationStatus','==','approved'),where('available','==',true),limit(200))),
-   getDocs(query(collection(db,'companyProfiles'),where('visibility','==','public'),where('status','==','active'),where('moderationStatus','==','approved'),limit(100)))
-  ]).then(([callDocs,proDocs,coDocs])=>{
-   const now=Date.now();const callList=callDocs.docs.map(d=>({id:d.id,...d.data()} as Call)).filter(c=>!c.deadline||c.deadline.toDate().getTime()>now);
-   setCalls(callList);setSelected(callList[0]?.id||'');
-   setProfessionals(proDocs.docs.map(d=>{const data=d.data();return {id:d.id,type:'professional',name:String(data.displayName||''),...data} as Candidate}));
-   setCompanies(coDocs.docs.map(d=>{const data=d.data();return {id:d.id,type:'company',name:String(data.name||''),...data} as Candidate}));
-  }).catch(()=>setError('Não foi possível abrir a fila. Verifique a permissão administrativa e os índices solicitados pelo Firestore.'))
-   .finally(()=>setLoading(false));
- },[]);
+  if(!user)return;
+  let active=true;
+  const timer=window.setTimeout(()=>{
+   void (async()=>{
+    setLoading(true);setError('');setIsAdmin(false);
+    try{
+     const {db}=getFirebaseClient();
+     const permission=await getDoc(doc(db,'adminPermissions',user.uid));
+     const allowed=permission.exists()&&permission.data().enabled===true;
+     if(!active)return;
+     setIsAdmin(allowed);
+     if(!allowed){setError(`Esta conta não tem permissão administrativa ativa (UID ${user.uid}).`);return;}
+     const [callDocs,proDocs,coDocs]=await Promise.all([
+      getDocs(query(collection(db,'serviceCalls'),where('status','in',['published','acceptingApplications']),where('companyStatus','==','active'),where('moderationStatus','==','approved'),limit(100))),
+      getDocs(query(collection(db,'professionalProfiles'),where('visibility','==','public'),where('accountStatus','==','active'),where('moderationStatus','==','approved'),where('available','==',true),limit(200))),
+      getDocs(query(collection(db,'companyProfiles'),where('visibility','==','public'),where('status','==','active'),where('moderationStatus','==','approved'),limit(100)))
+     ]);
+     if(!active)return;
+     const now=Date.now();const callList=callDocs.docs.map(d=>({id:d.id,...d.data()} as Call)).filter(c=>!c.deadline||c.deadline.toDate().getTime()>now);
+     setCalls(callList);setSelected(callList[0]?.id||'');
+     setProfessionals(proDocs.docs.map(d=>{const data=d.data();return {id:d.id,type:'professional',name:String(data.displayName||''),...data} as Candidate}));
+     setCompanies(coDocs.docs.map(d=>{const data=d.data();return {id:d.id,type:'company',name:String(data.name||''),...data} as Candidate}));
+    }catch(reason){if(active){setIsAdmin(false);setError(firebaseOperationError(reason,'Não foi possível abrir a fila administrativa.'));}}
+    finally{if(active)setLoading(false);}
+   })();
+  },0);
+  return()=>{active=false;window.clearTimeout(timer);};
+ },[user]);
  const activeCall=calls.find(c=>c.id===selected);
  const computed=useMemo(()=>{
   if(!activeCall)return [];
@@ -53,7 +70,7 @@ function DistributionContent(){
    return [{candidate,priority,reasons}];
   }).sort((a,b)=>a.priority-b.priority);
  },[activeCall,professionals,companies]);
- useEffect(()=>{setMatches(computed);},[computed]);
+ const matches=useMemo(()=>computed.map(item=>({...item,whatsAppUrl:whatsAppUrls[item.candidate.type+'_'+item.candidate.id]})),[computed,whatsAppUrls]);
  async function saveQueue(){
   if(!activeCall||!user)return;setError('');setMessage('');
   try{
@@ -85,7 +102,7 @@ function DistributionContent(){
    const deadline=activeCall.deadline?.toDate().toLocaleDateString('pt-BR')||'a combinar';
    const text=encodeURIComponent('Olá, '+match.candidate.name+'! Identificamos uma oportunidade compatível com sua área de atuação.\n\nServiço: '+activeCall.title+'\nCidade: '+activeCall.stateCode+' · IBGE '+activeCall.cityCode+'\nPrazo: '+deadline+'\nRemuneração: '+(activeCall.compensationDescription||'A combinar')+'\n\nAcesse a plataforma para consultar os detalhes e candidatar-se: '+window.location.origin+'/oportunidades/'+activeCall.id);
    const url='https://wa.me/'+digits+'?text='+text;
-   setMatches(current=>current.map(item=>item.candidate.id===match.candidate.id?{...item,whatsAppUrl:url}:item));
+   setWhatsAppUrls(current=>({...current,[match.candidate.type+'_'+match.candidate.id]:url}));
    await import('firebase/firestore').then(({addDoc,collection})=>addDoc(collection(db,'outreachEvents'),{serviceCallId:activeCall.id,companyId:activeCall.companyId,candidateType:match.candidate.type,candidateId:match.candidate.id,event:'prepared',criterionVersion,actorUid:user?.uid,createdAt:serverTimestamp()}));
   }catch{setError('Não foi possível preparar o contato assistido.')}
  }
@@ -103,6 +120,7 @@ function DistributionContent(){
   }catch{tab.close();setError('Não foi possível iniciar ou registrar o contato assistido.')}
  }
  if(loading)return <main className="page-wrap"><div className="notice-card">Calculando a fila…</div></main>;
+ if(!isAdmin)return <main className="page-wrap"><div className="notice-card"><h1>{error?'Não foi possível verificar o acesso':'Área administrativa restrita'}</h1><p>{error||'Esta conta não possui permissão administrativa ativa.'}</p><p>UID autenticado: <code>{user?.uid}</code> · Projeto: <code>{getFirebaseClient().app.options.projectId}</code></p><Link className="button button-secondary" href="/admin">Conferir acesso administrativo</Link></div></main>;
  return <main className="page-wrap"><div className="page-heading"><div><p className="eyebrow">DISTRIBUIÇÃO ADMINISTRATIVA</p><h1>Compatibilidade explicável</h1><p>Os resultados usam área declarada e consentimento para deslocamento, sem presumir disponibilidade por proximidade.</p></div></div>
   {error&&<p className="form-message">{error}</p>}{message&&<p className="success-message">{message}</p>}
   <section className="panel-card form-stack"><label>Oportunidade<select value={selected} onChange={e=>setSelected(e.target.value)}><option value="">Selecione</option>{calls.map(c=><option key={c.id} value={c.id}>{c.title} · {c.stateCode} · {c.cityCode}</option>)}</select></label>
