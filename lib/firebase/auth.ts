@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut, updateProfile, type User } from 'firebase/auth';
 import { doc, getDoc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { getFirebaseClient } from './client';
@@ -29,7 +29,6 @@ export async function registerWithEmail(name: string, email: string, password: s
 }
 export async function loginWithEmail(email: string, password: string) {
   const result = await signInWithEmailAndPassword(getFirebaseClient().auth, email.trim(), password);
-  await ensureUserDocuments(result.user);
   return result.user;
 }
 export async function logout() { await signOut(getFirebaseClient().auth); }
